@@ -10,6 +10,7 @@ library(Seurat)
 library(plotly)
 library(MASS)
 library(viridis)
+library(tibble)
 ```
 
 ```{r}
@@ -22,17 +23,19 @@ seu <- AddModuleScore(
   features = list(c("FOXP3","IL2RA","CTLA4")),
   name = "TregScore"
 )
+all_genes <- rownames(GetAssayData(seu, slot = "data"))
 ```
 ```{r}
 ui <- fluidPage(
+  
   titlePanel("scRNA Gating Explorer"),
   
-  # Top row: Scatter plot + gating summary + gene selectors
+  # Top row: Scatter plot + gene selectors + gating summary
   fluidRow(
     column(width = 6,
            plotlyOutput("scatter"),
-           selectInput("gene_x", "Gene X", choices = scaled_genes, selected = "CD3D"),
-           selectInput("gene_y", "Gene Y", choices = scaled_genes, selected = "CD8A")
+           selectInput("gene_x", "Gene X", choices = all_genes, selected = "CD3D"),
+           selectInput("gene_y", "Gene Y", choices = all_genes, selected = "CD8A")
     ),
     column(width = 6,
            h4("Gating Summary"),
@@ -47,39 +50,48 @@ ui <- fluidPage(
     ),
     column(width = 6,
            h4("Histogram of gated cells"),
-           selectInput("hist_gene", "Marker for histogram", choices = scaled_genes, selected = "CD3D"),
+           selectInput("hist_gene", "Marker for histogram", choices = all_genes, selected = "CD3D"),
            plotlyOutput("histogram")
+    )
+  ),
+  
+  # DE Analysis
+  fluidRow(
+    column(width = 12,
+           h4("Differential Expression: Gated vs Ungated"),
+           actionButton("run_dea", "Run DE Analysis"),
+           plotlyOutput("volcano_plot"),
+           tableOutput("deg_table")
     )
   )
 )
 ```
 ```{r}
 server <- function(input, output, session) {
-
-  # Store selected cell IDs
+  
+  # Store selected cells
   selected_cells <- reactiveVal(character(0))
   
-  ###### SCATTER PLOT ######
+  ###### Scatter plot with gating ######
   output$scatter <- renderPlotly({
     
-    df <- FetchData(seu, vars = c(input$gene_x, input$gene_y), slot = "data")
+    req(input$gene_x, input$gene_y)
+    
+    df <- as.data.frame(GetAssayData(seu, assay = "RNA", slot = "data")[c(input$gene_x, input$gene_y), ])
+    df <- as.data.frame(t(df))  # rows = cells
     df$cell <- rownames(df)
     
-    # Add jitter for clarity
-    df[[input$gene_x]] <- jitter(df[[input$gene_x]], amount = 0.02)
-    df[[input$gene_y]] <- jitter(df[[input$gene_y]], amount = 0.02)
+    # arcsinh + jitter
+    df[[input$gene_x]] <- asinh(jitter(df[[input$gene_x]], amount = 0.02))
+    df[[input$gene_y]] <- asinh(jitter(df[[input$gene_y]], amount = 0.02))
     
-    # Arcsinh transform
-    df[[input$gene_x]] <- asinh(df[[input$gene_x]])
-    df[[input$gene_y]] <- asinh(df[[input$gene_y]])
-    
-    # 2D density for coloring
+    # 2D density
     dens <- MASS::kde2d(df[[input$gene_x]], df[[input$gene_y]], n = 100)
     ix <- findInterval(df[[input$gene_x]], dens$x)
     iy <- findInterval(df[[input$gene_y]], dens$y)
     df$density <- dens$z[cbind(ix, iy)]
     
-    # Calculate axis buffer
+    # axis buffer
     x_min <- min(df[[input$gene_x]], na.rm = TRUE)
     x_max <- max(df[[input$gene_x]], na.rm = TRUE)
     y_min <- min(df[[input$gene_y]], na.rm = TRUE)
@@ -96,24 +108,18 @@ server <- function(input, output, session) {
       key = ~cell,
       source = "scatter",
       color = ~density,
-      colors = viridis(100),
+      colors = viridis::viridis(100),
       marker = list(size = 4),
       showlegend = FALSE
     ) %>%
       layout(
         dragmode = "select",
-        xaxis = list(
-          title = input$gene_x,
-          range = c(min(0, x_min - x_buffer), x_max + x_buffer)
-        ),
-        yaxis = list(
-          title = input$gene_y,
-          range = c(min(0, y_min - y_buffer), y_max + y_buffer)
-        )
+        xaxis = list(title = input$gene_x, range = c(min(0, x_min - x_buffer), x_max + x_buffer)),
+        yaxis = list(title = input$gene_y, range = c(min(0, y_min - y_buffer), y_max + y_buffer))
       )
   })
   
-  ###### CAPTURE SELECTION ######
+  ###### Capture rectangle selection ######
   observeEvent(event_data("plotly_selected", source = "scatter"), {
     s <- event_data("plotly_selected", source = "scatter")
     if (!is.null(s)) {
@@ -123,63 +129,169 @@ server <- function(input, output, session) {
     }
   })
   
-  ###### UMAP PLOT ######
+  ###### UMAP plot ######
   output$umap <- renderPlotly({
-    emb <- Embeddings(seu, "umap")[,1:2]
-    df_umap <- data.frame(
-      UMAP1 = emb[,1],
-      UMAP2 = emb[,2],
-      cell = rownames(emb)
+  
+  emb <- Embeddings(seu, "umap")[,1:2]
+  df_umap <- data.frame(
+    UMAP1 = emb[,1],
+    UMAP2 = emb[,2],
+    cell = rownames(emb)
+  )
+  
+  # Default grey for all cells
+  df_umap$selected <- "Other"
+  
+  # Turn selected cells red only if any cells have been gated
+  if(length(selected_cells()) > 0){
+    df_umap$selected[df_umap$cell %in% selected_cells()] <- "Selected"
+  }
+  
+  plot_ly(
+    df_umap,
+    x = ~UMAP1,
+    y = ~UMAP2,
+    type = "scattergl",
+    mode = "markers",
+    color = ~selected,
+    colors = c("grey", "red"),
+    marker = list(size = 4),
+    showlegend = TRUE
+  ) %>%
+    layout(
+      xaxis = list(title = "UMAP1", zeroline = FALSE),
+      yaxis = list(title = "UMAP2", zeroline = FALSE)
+    )
+})
+  
+  ###### Histogram / Density plot ######
+  output$histogram <- renderPlotly({
+  
+  req(input$hist_gene)
+  
+  df <- FetchData(seu, vars = input$hist_gene, slot = "data")
+  df$cell <- rownames(df)
+  df$selected <- df$cell %in% selected_cells()
+  
+  # Split gated / ungated
+  gated_vals <- df[[input$hist_gene]][df$selected]
+  ungated_vals <- df[[input$hist_gene]][!df$selected]
+  
+  # Check if we have enough points for density
+  safe_density <- function(x) {
+    if(length(x) > 1 && !all(is.na(x))) density(x, na.rm = TRUE) else NULL
+  }
+  
+  dens_gated <- safe_density(gated_vals)
+  dens_ungated <- safe_density(ungated_vals)
+  
+  p <- plot_ly()
+  
+  if(!is.null(dens_ungated)){
+    p <- p %>% add_lines(x = dens_ungated$x, y = dens_ungated$y, name = "Ungated", line = list(color="grey"))
+  }
+  
+  if(!is.null(dens_gated)){
+    p <- p %>% add_lines(x = dens_gated$x, y = dens_gated$y, name = "Gated", line = list(color="red"))
+  }
+  
+  # Placeholder if no densities
+  if(is.null(dens_gated) && is.null(dens_ungated)){
+    p <- p %>% add_trace(x = 0, y = 0, type="scatter", mode="markers", marker=list(color="transparent"))
+  }
+  
+  p %>% layout(
+    title = paste("Density:", input$hist_gene),
+    xaxis = list(title = input$hist_gene),
+    yaxis = list(title = "Density")
+  )
+})
+  
+  ###### DE Analysis ######
+  # Store DEA results and top10 in reactiveValues
+rv <- reactiveValues(dea_res = NULL, top10 = NULL)
+
+# Run DEA when button is clicked
+observeEvent(input$run_dea, {
+  
+  gated <- selected_cells()
+  
+  # Require at least 2 cells to run
+  if(length(gated) < 2){
+    showNotification("Select at least 2 cells to run DE analysis.", type = "error")
+    return(NULL)
+  }
+  
+  withProgress(message = "Running DE Analysis...", value = 0, {
+    
+    incProgress(0.1, detail = "Preparing cell sets")
+    Sys.sleep(0.1)
+    
+    all_cells <- Cells(seu)
+    ungated <- setdiff(all_cells, gated)
+    
+    # Downsample ungated cells to 5x the number of gated cells for speed
+    set.seed(123)
+    ungated_sample <- sample(ungated, size = min(length(ungated), 5*length(gated)))
+    
+    incProgress(0.3, detail = "Running FindMarkers")
+    
+    dea <- FindMarkers(
+      seu,
+      ident.1 = gated,
+      ident.2 = ungated_sample,
+      assay = "RNA",
+      slot = "data",
+      logfc.threshold = 0
     )
     
-    # Default grey, red for selected cells
-    df_umap$color <- "grey"
-    df_umap$color[df_umap$cell %in% selected_cells()] <- "red"
+    incProgress(0.7, detail = "Processing results")
     
-    plot_ly(
-      df_umap,
-      x = ~UMAP1,
-      y = ~UMAP2,
-      type = "scattergl",
-      mode = "markers",
-      color = ~color,
-      colors = c("grey", "red"),
-      marker = list(size = 4),
-      showlegend = FALSE
-    ) %>%
-      layout(
-        xaxis = list(title = "UMAP1", zeroline=F),
-        yaxis = list(title = "UMAP2", zeroline=F)
-      )
+    # Add gene names for plotting and tables
+    dea$gene <- rownames(dea)
+    
+    # Sort by adjusted p-value and get top 10 by logFC
+    top10 <- dea %>% dplyr::arrange(p_val_adj) %>% head(10)
+    
+    # Store in reactiveValues
+    rv$dea_res <- dea
+    rv$top10 <- top10
+    
+    incProgress(1, detail = "Done!")
   })
+})
+
+# Volcano plot
+output$volcano_plot <- renderPlotly({
+  req(rv$dea_res)
+  dea <- rv$dea_res
   
-  ###### GATING SUMMARY ######
-  output$gate_summary <- renderPrint({
-    total_cells <- ncol(seu)
-    gated <- length(selected_cells())
-    pct_gated <- ifelse(total_cells > 0, round(100 * gated / total_cells, 2), 0)
-    cat("Total cells:", total_cells, "\n")
-    cat("Gated cells:", gated, "\n")
-    cat("Percent gated:", pct_gated, "%\n")
-  })
-  
-  ###### HISTOGRAM/DENSITY OF SELECTED MARKER ######
-  output$hist_marker <- renderPlotly({
-    req(input$hist_gene)  # dropdown for histogram gene
-    
-    df <- FetchData(seu, vars = input$hist_gene, slot = "data")
-    df$cell <- rownames(df)
-    df$gated <- ifelse(df$cell %in% selected_cells(), "Gated", "All")
-    
-    plot_ly(df, x = ~get(input$hist_gene), color = ~gated, type = "histogram", 
-            opacity = 0.6, barmode = "overlay") %>%
-      layout(
-        xaxis = list(title = input$hist_gene),
-        yaxis = list(title = "Count")
-      )
-  })
+  plot_ly(
+    dea,
+    x = ~avg_log2FC,
+    y = ~-log10(p_val_adj + 1e-300),  # avoid log(0)
+    type = "scatter",
+    mode = "markers",
+    text = ~gene,
+    marker = list(size = 6,
+                  color = ifelse(dea$gene %in% rv$top10$gene, "red", "grey")),
+    hoverinfo = "text+x+y"
+  ) %>%
+    layout(
+      xaxis = list(title = "Log2 Fold Change"),
+      yaxis = list(title = "-log10(Adjusted P-value)")
+    )
+})
+
+# Table of top 10 DEGs
+output$deg_table <- renderTable({
+  req(rv$top10)
+  rv$top10 %>%
+    dplyr::select(gene, avg_log2FC, p_val, p_val_adj)
+})
   
 }
+
 ```
 ```{r}
 shinyApp(ui, server)
