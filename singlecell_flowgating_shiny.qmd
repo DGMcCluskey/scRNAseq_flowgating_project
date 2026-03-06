@@ -227,19 +227,21 @@ observeEvent(input$run_dea, {
     incProgress(0.1, detail = "Preparing cell sets")
     Sys.sleep(0.1)
     
-    all_cells <- Cells(seu)
-    ungated <- setdiff(all_cells, gated)
-    
-    # Downsample ungated cells to 5x the number of gated cells for speed
-    set.seed(123)
-    ungated_sample <- sample(ungated, size = min(length(ungated), 5*length(gated)))
+    max_cells <- 1000
+
+gated <- intersect(selected_cells(), Cells(seu))
+ungated <- setdiff(Cells(seu), selected_cells())
+
+# downsample
+if(length(gated) > max_cells) gated <- sample(gated, max_cells)
+if(length(ungated) > max_cells) ungated <- sample(ungated, max_cells)
     
     incProgress(0.3, detail = "Running FindMarkers")
     
     dea <- FindMarkers(
       seu,
       ident.1 = gated,
-      ident.2 = ungated_sample,
+      ident.2 = ungated,
       assay = "RNA",
       slot = "data",
       logfc.threshold = 0
