@@ -1,0 +1,186 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r}
+library(shiny)
+library(Seurat)
+library(plotly)
+library(MASS)
+library(viridis)
+```
+
+```{r}
+seu <- readRDS("C:/Users/dan_m/OneDrive - University College London/UCL_Senior_Research_Fellow/Cutaneous lupus public data/GSE186476_RAW/bili_etal_cle_immune_only.rds")
+```
+
+```{r}
+seu <- AddModuleScore(
+  seu,
+  features = list(c("FOXP3","IL2RA","CTLA4")),
+  name = "TregScore"
+)
+```
+```{r}
+ui <- fluidPage(
+  titlePanel("scRNA Gating Explorer"),
+  
+  # Top row: Scatter plot + gating summary + gene selectors
+  fluidRow(
+    column(width = 6,
+           plotlyOutput("scatter"),
+           selectInput("gene_x", "Gene X", choices = scaled_genes, selected = "CD3D"),
+           selectInput("gene_y", "Gene Y", choices = scaled_genes, selected = "CD8A")
+    ),
+    column(width = 6,
+           h4("Gating Summary"),
+           verbatimTextOutput("gate_summary")
+    )
+  ),
+  
+  # Bottom row: UMAP + histogram
+  fluidRow(
+    column(width = 6,
+           plotlyOutput("umap")
+    ),
+    column(width = 6,
+           h4("Histogram of gated cells"),
+           selectInput("hist_gene", "Marker for histogram", choices = scaled_genes, selected = "CD3D"),
+           plotlyOutput("histogram")
+    )
+  )
+)
+```
+```{r}
+server <- function(input, output, session) {
+
+  # Store selected cell IDs
+  selected_cells <- reactiveVal(character(0))
+  
+  ###### SCATTER PLOT ######
+  output$scatter <- renderPlotly({
+    
+    df <- FetchData(seu, vars = c(input$gene_x, input$gene_y), slot = "data")
+    df$cell <- rownames(df)
+    
+    # Add jitter for clarity
+    df[[input$gene_x]] <- jitter(df[[input$gene_x]], amount = 0.02)
+    df[[input$gene_y]] <- jitter(df[[input$gene_y]], amount = 0.02)
+    
+    # Arcsinh transform
+    df[[input$gene_x]] <- asinh(df[[input$gene_x]])
+    df[[input$gene_y]] <- asinh(df[[input$gene_y]])
+    
+    # 2D density for coloring
+    dens <- MASS::kde2d(df[[input$gene_x]], df[[input$gene_y]], n = 100)
+    ix <- findInterval(df[[input$gene_x]], dens$x)
+    iy <- findInterval(df[[input$gene_y]], dens$y)
+    df$density <- dens$z[cbind(ix, iy)]
+    
+    # Calculate axis buffer
+    x_min <- min(df[[input$gene_x]], na.rm = TRUE)
+    x_max <- max(df[[input$gene_x]], na.rm = TRUE)
+    y_min <- min(df[[input$gene_y]], na.rm = TRUE)
+    y_max <- max(df[[input$gene_y]], na.rm = TRUE)
+    x_buffer <- 0.05 * (x_max - x_min)
+    y_buffer <- 0.05 * (y_max - y_min)
+    
+    plot_ly(
+      df,
+      x = ~get(input$gene_x),
+      y = ~get(input$gene_y),
+      type = "scattergl",
+      mode = "markers",
+      key = ~cell,
+      source = "scatter",
+      color = ~density,
+      colors = viridis(100),
+      marker = list(size = 4),
+      showlegend = FALSE
+    ) %>%
+      layout(
+        dragmode = "select",
+        xaxis = list(
+          title = input$gene_x,
+          range = c(min(0, x_min - x_buffer), x_max + x_buffer)
+        ),
+        yaxis = list(
+          title = input$gene_y,
+          range = c(min(0, y_min - y_buffer), y_max + y_buffer)
+        )
+      )
+  })
+  
+  ###### CAPTURE SELECTION ######
+  observeEvent(event_data("plotly_selected", source = "scatter"), {
+    s <- event_data("plotly_selected", source = "scatter")
+    if (!is.null(s)) {
+      selected_cells(s$key)
+    } else {
+      selected_cells(character(0))
+    }
+  })
+  
+  ###### UMAP PLOT ######
+  output$umap <- renderPlotly({
+    emb <- Embeddings(seu, "umap")[,1:2]
+    df_umap <- data.frame(
+      UMAP1 = emb[,1],
+      UMAP2 = emb[,2],
+      cell = rownames(emb)
+    )
+    
+    # Default grey, red for selected cells
+    df_umap$color <- "grey"
+    df_umap$color[df_umap$cell %in% selected_cells()] <- "red"
+    
+    plot_ly(
+      df_umap,
+      x = ~UMAP1,
+      y = ~UMAP2,
+      type = "scattergl",
+      mode = "markers",
+      color = ~color,
+      colors = c("grey", "red"),
+      marker = list(size = 4),
+      showlegend = FALSE
+    ) %>%
+      layout(
+        xaxis = list(title = "UMAP1", zeroline=F),
+        yaxis = list(title = "UMAP2", zeroline=F)
+      )
+  })
+  
+  ###### GATING SUMMARY ######
+  output$gate_summary <- renderPrint({
+    total_cells <- ncol(seu)
+    gated <- length(selected_cells())
+    pct_gated <- ifelse(total_cells > 0, round(100 * gated / total_cells, 2), 0)
+    cat("Total cells:", total_cells, "\n")
+    cat("Gated cells:", gated, "\n")
+    cat("Percent gated:", pct_gated, "%\n")
+  })
+  
+  ###### HISTOGRAM/DENSITY OF SELECTED MARKER ######
+  output$hist_marker <- renderPlotly({
+    req(input$hist_gene)  # dropdown for histogram gene
+    
+    df <- FetchData(seu, vars = input$hist_gene, slot = "data")
+    df$cell <- rownames(df)
+    df$gated <- ifelse(df$cell %in% selected_cells(), "Gated", "All")
+    
+    plot_ly(df, x = ~get(input$hist_gene), color = ~gated, type = "histogram", 
+            opacity = 0.6, barmode = "overlay") %>%
+      layout(
+        xaxis = list(title = input$hist_gene),
+        yaxis = list(title = "Count")
+      )
+  })
+  
+}
+```
+```{r}
+shinyApp(ui, server)
+```
